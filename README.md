@@ -276,11 +276,7 @@ The composite action in [action.yml](action.yml) supports these inputs:
 
 ## Known limitations
 
-- context extraction is regex-based and not a full parser for every test runner format
-- patch application may fail if the file context has drifted
-- GitHub Actions cache is best-effort and keyed to environment inputs
-- LangGraph state is in-memory only for one local CLI run
-- tracing is optional and metadata-only when enabled
+- will be mentioned
 
 ## Running tests locally
 
