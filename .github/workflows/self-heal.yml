@@ -1,4 +1,4 @@
-# This repository uses its own action ("dogfooding"): when CI fails on main, it tries to fix the tests
+# This repository uses its own action ("dogfooding"): when CI fails on any branch or merge request of this repo, it tries to fix the tests
 # and opens a self-healing/main pull request. Needs the repository secret ANTHROPIC_API_KEY
 # (and optionally LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY) plus Settings -> Actions -> General ->
 # "Allow GitHub Actions to create and approve pull requests".
@@ -9,7 +9,6 @@ on:
   workflow_run:
     workflows: ["CI"]
     types: [completed]
-    branches: [main]            # only react to failures on main, to keep paid runs rare
 
 permissions:
   contents: write
@@ -26,6 +25,7 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'failure' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
        !startsWith(github.event.workflow_run.head_branch, 'self-healing/'))
     steps:
       - uses: actions/checkout@v4

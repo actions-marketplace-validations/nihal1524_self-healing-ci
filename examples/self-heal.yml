@@ -22,10 +22,12 @@ jobs:
   heal:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # For the workflow_run trigger: only after a failure, and never on a self-healing branch (loop guard).
+    # For the workflow_run trigger: only after a failure, only for branches of this repo (never forks,
+    # whose code must not run with your secrets), and never on a self-healing branch (loop guard).
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'failure' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
        !startsWith(github.event.workflow_run.head_branch, 'self-healing/'))
     steps:
       - uses: actions/checkout@v4

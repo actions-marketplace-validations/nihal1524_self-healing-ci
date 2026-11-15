@@ -1,29 +1,203 @@
-# Self-Healing CI/CD — Phase 2 (LangGraph workflow)
+# Self-Healing CI/CD — Phase 3 (LangGraph + GitHub Action + cached Docker images)
 
-A local CLI prototype that uses LangGraph to orchestrate a target repository's
-test, diagnosis, patch, and verification steps. Docker runs tests; the workflow
-extracts likely relevant files, asks Claude for a structured patch, applies it
-to the local working tree, and reruns tests to verify the change.
+Self-Healing CI/CD is a repo-local repair loop that turns failing test output into a verified code fix.
+The project combines:
 
-## Prerequisites
+- a local CLI runner (`heal.py`)
+- a LangGraph workflow (`core/workflow.py`)
+- Docker-based test execution (`core/docker_runner.py`)
+- AI patch generation via Anthropic
+- automatic PR creation through a GitHub Action (`action.yml`)
+- cached Docker environment images via `scripts/image_cache.sh` and GitHub Actions cache
 
-| Requirement | Purpose | Check |
-|---|---|---|
-| Python 3.10+ | Runs this CLI | `python3 --version` |
-| Docker Desktop (or compatible Docker daemon) running | Runs the target tests in an isolated container | `docker ps` |
-| Git and the `patch` utility | Applies generated unified diffs | `git --version`, `patch --version` |
-| Anthropic API key | Generates proposed fixes | `ANTHROPIC_API_KEY` must be set |
-| LangGraph | Orchestrates workflow nodes and routing | Installed by `requirements.txt` |
-| Network access | Installs test/lint tools in the container and calls Anthropic | — |
+The goal is simple: when CI fails, extract the failing context, ask an LLM for a patch, apply it, verify it in a fresh Docker container, and open a PR only when the fix is real.
 
-Auto-detection supports a basic Python/pytest workflow and a Node/npm workflow.
-For Python, a `requirements.txt` is optional. For Node, the target must have a
-`package.json` with a working `test` script. Override detection with `--image`
-and `--test-cmd` when needed.
+## Why this project exists
 
-## Setup
+Most failing builds still require a human to debug the test output, identify the root cause, and write a patch. This project automates that loop in a controlled way:
 
-From the project directory:
+- it runs tests in an isolated container
+- it extracts the likely failure files and surrounding context
+- it asks the model for a patch plan
+- it retries only a few times before stopping
+- it verifies the final patch in a fresh container
+- it can open a PR from GitHub Actions for the branch that failed
+
+This keeps the repair loop focused on reproducible validation instead of blind AI edits.
+
+## Architecture: the LangGraph repair loop
+
+```mermaid
+flowchart TD
+    A[run_tests] --> B{Did tests pass?}
+    B -- yes --> Z[done: success or already_passing]
+    B -- no --> C[extract_context]
+    C --> D{Any relevant files?}
+    D -- no --> Z2[done: no_context]
+    D -- yes --> E[generate_plan]
+    E --> F{Patch plan returned?}
+    F -- no --> Z3[done: llm_error]
+    F -- yes --> G[apply_plan]
+    G --> H{Patch applied cleanly?}
+    H -- patch_retry --> C
+    H -- patches_applied --> A
+    H -- patch_error --> Z4[done: patch_error]
+    A --> I{Max attempts exhausted?}
+    I -- yes --> J[mark_exhausted]
+    J --> Z5[done: verification_failed]
+```
+
+The actual graph in [core/workflow.py](core/workflow.py) is a state machine with these phases:
+
+1. `run_tests`
+2. `extract_context`
+3. `generate_plan`
+4. `apply_plan`
+5. loop back to `run_tests` until success or the configured attempt limit is reached
+
+This is the core “self-healing” loop: fail -> inspect -> propose -> patch -> verify -> repeat.
+
+## How the project works end-to-end
+
+### 1) Local CLI execution
+`heal.py` is the entry point. It parses the repo path and optional flags such as:
+
+- `--image`
+- `--platform`
+- `--test-cmd`
+- `--setup-cmd`
+- `--max-attempts`
+- `--model`
+- `--result-file`
+
+It creates a `DockerTestRunner`, runs the workflow, and then writes a JSON result file if requested.
+
+### 2) Dockerized test run
+`core/docker_runner.py` does the container work:
+
+- detects the base image automatically
+- optionally bakes dependencies into a reusable image
+- mounts the repo into `/app`
+- runs the test command in a fresh container
+- captures stdout/stderr and exit code
+
+The dependency image is tagged as `self-heal-setup:<hash>` so it can be reused across runs.
+
+### 3) Context extraction
+`core/context_extractor.py` reads the failing test output and extracts likely relevant source files, traceback locations, and nearby file context.
+
+### 4) Patch generation
+`core/patch_generator.py` sends the failure plus context to Anthropic and asks for a structured patch plan. The patch plan is validated through Pydantic models in `core/models.py`.
+
+### 5) Patch application
+`core/patch_applier.py` applies each patch to the repo working tree using `git apply` or `patch -p1`, leaving generated patch files behind for review.
+
+### 6) Re-run and verify
+The workflow loops until:
+
+- the tests pass
+- the repo is already passing
+- the max attempt count is reached
+- the patch cannot be applied or no context is found
+
+## Docker image caching behavior
+
+The project caches the prepared test environment between GitHub Action runs.
+
+This is implemented in:
+
+- [action.yml](action.yml)
+- [scripts/image_cache.sh](scripts/image_cache.sh)
+- [core/docker_runner.py](core/docker_runner.py)
+
+The flow is:
+
+1. compute a cache key from:
+   - base image
+   - setup command
+   - requirements files
+   - Docker runner code itself
+2. restore the matching tar.gz archive from GitHub Actions cache
+3. `docker load` it onto the runner
+4. run the self-healing flow
+5. if no cache hit, `docker save` the image(s) and save them back to cache
+
+This avoids rebuilding dependency-heavy Docker images on every workflow run.
+
+## Langfuse traceability and observability
+
+The project supports optional tracing through Langfuse so every repair run is auditable.
+
+When `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and `LANGFUSE_BASE_URL` are present, `heal.py` opens a trace for each run and records metadata such as:
+
+- run status
+- exit code
+- performed fix attempts
+- patch application failures
+- file paths touched during context extraction
+- model name and repo name
+- final trace URL so you can inspect it in Langfuse
+
+The trace is intentionally metadata-only. It does not dump full prompts or repository contents, and it does not log the entire test output by default; the workflow only keeps summaries and key fields needed to understand what happened.
+
+This makes the system useful for debugging model behavior and verifying that a failed CI run was repaired by a legitimate patch rather than an accidental or silent no-op.
+
+> Why there is no `platform` in the action command by default: the local CLI already supports `--platform`, but the composite action interface did not expose it until this fix. The action now forwards `platform` to `heal.py`, which matters for Apple Silicon hosts or projects that need `linux/amd64` compatibility.
+
+## 3-step Quickstart
+
+Add this workflow to your repo and replace the example values with your project details.
+
+```yaml
+# 1) Add .github/workflows/self-heal.yml
+name: Self-healing CI
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+jobs:
+  self-heal:
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # 2) Add the action and pass the required inputs
+      - name: Heal the failing branch
+        uses: your-org/self-healing-ci@v1
+        with:
+          test-cmd: pytest -q
+          setup-cmd: pip install -r requirements.txt
+          image: python:3.11
+          platform: linux/amd64   # optional, useful on Apple Silicon or cross-arch builds
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          create-pr: "true"
+          cache-image: "true"
+
+      # 3) Watch for the PR created from the self-healing branch
+      # The action creates/updates a branch like self-healing/<branch>
+      # and opens a PR back to the original failing branch.
+```
+
+That is the fastest way to use the action in a real repository.
+
+## Local quickstart
+
+### Prerequisites
+
+| Requirement | Purpose |
+|---|---|
+| Python 3.10+ | run the CLI |
+| Docker Desktop or a working Docker daemon | run tests in containers |
+| Git | review and apply patches |
+| Anthropic API key | generate fixes |
+
+### Setup
 
 ```bash
 python3 -m venv .venv
@@ -32,8 +206,7 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Edit `.env` and put your Anthropic key there. In zsh, load it into the current
-terminal before running the CLI:
+Then set your token:
 
 ```bash
 set -a
@@ -41,275 +214,83 @@ source .env
 set +a
 ```
 
-Alternatively, set `ANTHROPIC_API_KEY` directly in the terminal environment.
-The Python CLI does not itself load `.env`; in VS Code, enable
-`python.terminal.useEnvFile` and open a new terminal, or source the file as
-shown above. Never commit `.env` or share its key. `.env.example` is a safe
-placeholder template.
-
-Confirm Docker is available:
+Or export directly:
 
 ```bash
-docker ps
+export ANTHROPIC_API_KEY="your_key_here"
 ```
 
-An empty container list is fine; it means no containers are currently running.
-If the command errors, start Docker Desktop and retry.
-
-## Try the included samples
-
-The simple calculator sample has an intentional failing addition test:
+### Try it against a sample repo
 
 ```bash
-python3 heal.py ./sample-failing-repo
+python3 heal.py ./sample-failing-repo --max-attempts 3
 ```
 
-The business-pricing sample contains more than one intentional issue, including
-a missing import and a free-shipping business-rule bug:
+### Run it against your repo
 
 ```bash
-python3 heal.py ./sample-business-repo --max-attempts 3
+python3 heal.py /path/to/your/repo --max-attempts 3
 ```
 
-The LLM response depends on the test output and provider/model behavior, so
-exact proposed diffs may vary.
+## GitHub Action inputs
 
-### Repeatable repair fixtures
+The composite action in [action.yml](action.yml) supports these inputs:
 
-Two additional fixtures have committed `main` (broken baseline) and
-`known-good` (passing reference) branches. They are currently checked out on
-`main` so the CLI sees the broken version. The known-good branches let you
-compare the expected repaired state without relying on the LLM's exact patch.
-
-**Direct failure, import-based context discovery, runtime error, and multi-file
-repair:**
-
-```bash
-python3 heal.py ./sample-direct-multifile --max-attempts 3
-```
-
-The multiplication test fails at an assertion, while a separate tax test
-raises a missing-import `NameError`. The implementation module for the
-multiplication failure is imported by the test but does not have its own
-traceback frame. A complete repair touches both implementation files.
-
-**Pytest collection-time import error:**
-
-```bash
-python3 heal.py ./sample-collection-error --max-attempts 2
-```
-
-This fails while importing a misspelled Decimal constant during test
-collection, before pytest executes the test body.
-
-To reset either fixture after a run, discard its uncommitted changes and remove
-ignored test caches/generated patch files, returning to its committed broken
-baseline:
-
-```bash
-git -C sample-direct-multifile switch main
-git -C sample-direct-multifile reset --hard
-git -C sample-direct-multifile clean -fdX
-git -C sample-collection-error switch main
-git -C sample-collection-error reset --hard
-git -C sample-collection-error clean -fdX
-```
-
-To run the independently committed passing references, switch one fixture to
-`known-good` and run pytest from its directory:
-
-```bash
-git -C sample-direct-multifile switch known-good
-git -C sample-direct-multifile clean -fdX
-cd sample-direct-multifile && python -m pytest -q
-```
-
-Switch back to `main` before using `heal.py`. The lightweight workflow tests
-also cover initial-pass/no-LLM, final verification exhaustion, and a patch
-application failure without making Docker or API calls. A separate patch
-applier test exercises a stale diff against a temporary working tree.
-
-## Run against your own repository
-
-Use the actual local path to your target repo (the paths below are examples):
-
-```bash
-python3 heal.py /path/to/your/repo
-python3 heal.py /path/to/your/repo --max-attempts 5
-python3 heal.py /path/to/your/repo \
-  --image python:3.12-slim \
-  --test-cmd "(ruff check . || true) && python -m pytest -v --junitxml=/app/report.xml"
-```
-
-For Python repositories with a root `requirements.txt`, the runner automatically
-builds a reusable dependency image. The image cache key includes the base image
-and contents of the root and included requirements files, so edits to source
-reuse the image while dependency changes build a new one. Third-party packages,
-pytest, and Ruff are installed into that image. Local editable requirements
-such as `-e .` are omitted from the image and installed from the live mounted
-checkout before tests. Each test attempt still uses a fresh container.
-
-For additional OS packages or specialized environment setup, pass `--setup-cmd`.
-That command runs during Docker image build, so use it for environment
-dependencies—not commands that need the checked-out source tree. The image is
-tagged from the base image and setup command. Tests still run in a fresh
-container with the repository mounted at `/app`:
-
-```bash
-python3 heal.py /path/to/your/repo \
-  --image python:3.12-slim \
-  --setup-cmd "apt-get update && apt-get install -y --no-install-recommends build-essential && pip install pytest numpy" \
-  --test-cmd "python -m pytest -v --junitxml=/app/report.xml"
-```
-
-For legacy projects whose pinned dependencies only publish wheels for another
-CPU architecture, select a Docker target platform (for example,
-`--platform linux/amd64` on Apple Silicon). The platform is used for both image
-build and test containers and is part of the prepared-image cache key. Cross-
-architecture execution requires Docker emulation and can be slower.
-
-The first image build still downloads and installs dependencies. Later attempts
-and runs reuse the image when the base image and dependency inputs are
-unchanged. Project-source compilation (for example, building native extensions
-from the mounted pandas checkout) is source-dependent and remains a separate
-build step; it is not performed in the dependency image.
-
-For Python projects without a root `requirements.txt`, the default test command
-installs pytest and Ruff at runtime. With a root `requirements.txt`, those
-dependencies are installed in the prepared image, and the test command avoids
-reinstalling them. The runner removes stale Python `__pycache__` directories,
-runs `ruff check .` in check-only mode, then runs `python -m pytest -v`.
-Clearing bytecode avoids accidentally testing stale code after a quick patch or
-Git branch switch. Ruff does not auto-edit target files.
-Its nonzero status is currently ignored so pytest still runs; therefore, a
-“Tests passed!” result means pytest passed, not necessarily that Ruff reported
-no lint issues. Node projects use `npm install` and `npm test` by default.
-
-`--max-attempts` means the maximum number of patch-generation/application
-attempts. The CLI performs up to one additional test run to verify the last
-patch. For example, `--max-attempts 3` allows up to three fixes plus a final
-verification run. A failed patch application stops the run; the CLI does not
-automatically roll back already-applied changes.
-
-## Pipeline components
-
-- **Docker execution** — `core/docker_runner.py` mounts the target repo
-  read-write at `/app`, runs its test command, captures logs/exit status, and
-  removes the temporary container.
-- **Failure context** — `core/context_extractor.py` uses lightweight regexes
-  over pytest output, Python tracebacks, and JavaScript stack traces, then reads
-  matching files from the local repo.
-- **LLM contract/call** — `core/models.py` defines Pydantic `PatchPlan` and
-  `ProposedPatch` models. `core/patch_generator.py` sends the context to Claude
-  using Anthropic tool calling and validates the returned data as a `PatchPlan`.
-- **Patch application** — `core/patch_applier.py` writes each unified diff to
-  an `attemptN_i.patch` file inside the target repo and tries `git apply`, then
-  falls back to `patch -p1`.
-- **Workflow state and routing** — `core/workflow.py` defines a LangGraph
-  `StateGraph` with state for the repo, test output, contexts, patch plan, and
-  fix count. Conditional edges route success to the end, test failures through
-  context/generation/application, and final failed verification to failure.
-- **CLI entry point** — `heal.py` remains the local command-line interface. It
-  parses options and invokes the compiled graph, so local sample testing stays
-  available through the same command.
-- **Retry and verification** — the graph allows the configured number of
-  successful patch applications, then performs one additional test run to
-  verify the last patch. Missing context or failed patch application stops the
-  graph without continuing to another test run.
-
-## Observability (Langfuse, optional)
-
-Set `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` and `LANGFUSE_BASE_URL` (see
-`.env.example`) to trace each run; without them tracing is a silent no-op. Only
-metadata is sent: statuses, exit codes, file paths, token usage and the model's
-`old`/`new` edits. Prompts, file contents and test output are never recorded.
-
-Each `heal.py` run is one trace (`self-heal`) with spans `run-tests`,
-`extract-context`, `generate-plan`, `apply-plan` and one `patch-generation`
-generation per model call. Add `--trace-tag <name>` (repeatable) to label a run,
-for example with a BugsInPy bug id.
-
-## GitHub Action (open a PR when CI fails)
-
-`action.yml` at the repo root is a composite action. In the repository you want healed, copy
-`examples/self-heal.yml` to `.github/workflows/self-heal.yml` and set `test-cmd` (and `setup-cmd`,
-`image`). When the tests fail, the action runs `heal.py` on the runner, and if a fix is found it
-pushes `self-healing/<branch>` and opens (or updates) a pull request into `<branch>`.
-
-### Action inputs
-
-Set these under `with:` in the workflow that calls the action (`.github/workflows/self-heal.yml`).
-Defaults live in `action.yml`.
-
-| Input | Required | Default | What it does |
+| Input | Required | Default | Purpose |
 |---|---|---|---|
-| `test-cmd` | yes | | Command that runs the tests inside the container, e.g. `python -m pytest -q` |
-| `setup-cmd` | no | none | Run once to build a cached environment image, e.g. `pip install -r requirements.txt` |
-| `image` | no | auto-detect | Docker base image the tests run in, e.g. `python:3.11` |
-| `max-attempts` | no | `3` | Fix attempts before giving up (plus one final verification run) |
-| `model` | no | `claude-sonnet-5-5` | Anthropic model used to generate fixes |
-| `anthropic-api-key` | yes | | Pass `${{ secrets.ANTHROPIC_API_KEY }}` |
-| `github-token` | yes | | Token that pushes the branch and opens the PR, usually `${{ secrets.GITHUB_TOKEN }}` |
-| `branch` | no | triggering branch | Branch whose tests failed; the fix goes to `self-healing/<branch>` |
-| `create-pr` | no | `true` | Open a pull request when a fix is found |
-| `fail-if-unhealed` | no | `true` | Fail the job when no fix could be found |
-| `langfuse-public-key`, `langfuse-secret-key`, `langfuse-base-url` | no | off | Enable Langfuse tracing |
+| `test-cmd` | yes | | command that runs tests in the container |
+| `setup-cmd` | no | empty | one-time env setup for the Docker image |
+| `image` | no | empty | base Docker image |
+| `max-attempts` | no | `3` | max fix attempts plus one final verification |
+| `model` | no | `claude-sonnet-5-5` | Anthropic model |
+| `anthropic-api-key` | yes | | API key |
+| `github-token` | yes | | token for branch + PR creation |
+| `branch` | no | triggering branch | target branch |
+| `create-pr` | no | `true` | create a PR when fix succeeds |
+| `fail-if-unhealed` | no | `true` | fail the workflow when no fix is found |
+| `cache-image` | no | `true` | reuse prepared Docker images across runs |
+| `langfuse-public-key` | no | empty | tracing public key |
+| `langfuse-secret-key` | no | empty | tracing secret key |
+| `langfuse-base-url` | no | empty | tracing host |
 
-The apply-retry limit (how many rejected edits are retried per run) is not an input; it is the
-constant `MAX_APPLY_FAILURES` (2) in `core/workflow.py`.
+## Project layout
 
-- Run it by hand first (`workflow_dispatch`), then enable the `workflow_run` trigger.
-- Loop guard: it never runs for a branch that starts with `self-healing/`.
-- Secrets: pass `ANTHROPIC_API_KEY` (and optionally the Langfuse keys) from repository secrets.
-- Repo setting: "Allow GitHub Actions to create and approve pull requests" must be on.
-- `heal.py --result-file result.json` writes a JSON summary (status, attempts, root cause) that the
-  action uses for the PR body.
+- `heal.py` — local CLI entry point
+- `core/workflow.py` — LangGraph loop and routing
+- `core/docker_runner.py` — isolated Docker test execution and image building
+- `core/context_extractor.py` — failure context extraction
+- `core/patch_generator.py` — LLM patch generation
+- `core/patch_applier.py` — patch application to the repo
+- `core/models.py` — patch contracts
+- `action.yml` — composite GitHub Action used in CI
+- `scripts/image_cache.sh` — Docker image save/load/cache logic
+- `sample-*` folders — repair fixtures and regression tests
 
-## Review changes carefully
+## Safety notes
 
-The target repository is mounted read-write. LLM patch application can modify
-its local files; Ruff runs in check-only mode and does not make edits. Run the
-pipeline on a clean Git working tree when possible, then review changes before
-committing:
-
-```bash
-git -C /path/to/your/repo status
-git -C /path/to/your/repo diff
-```
-
-Generated patch files are left in the target repo. The pipeline does not commit
-changes or automatically roll them back. Do not run it unattended against a
-repository whose edits you cannot safely review or restore.
+- The target repo is mounted read-write while patches are applied.
+- Generated patch files are left in the repo for review.
+- The workflow avoids self-healing loops by skipping branches whose names start with `self-healing/`.
+- The action uses GitHub Actions cache to persist the Docker environment between runs.
+- You should run it against clean repos and review diffs before merging.
 
 ## Known limitations
 
-- File discovery is regex-based, not a full pytest/Jest report parser; some
-  unusual failure formats may not yield usable context.
-- Ruff is check-only in the default command. Its nonzero status is ignored so
-  pytest can still run; lint findings alone do not trigger a repair request.
-- Patch application can leave partial changes if one patch in a multi-patch
-  plan applies but a later patch fails.
-- LangGraph state is held in memory for the duration of one CLI invocation;
-  checkpointing and pause/resume are not configured.
-- Langfuse tracing/observability, CI webhook integration, patch sandboxing, and
-  automated rollback are not integrated yet.
+- context extraction is regex-based and not a full parser for every test runner format
+- patch application may fail if the file context has drifted
+- GitHub Actions cache is best-effort and keyed to environment inputs
+- LangGraph state is in-memory only for one local CLI run
+- tracing is optional and metadata-only when enabled
 
-The graph routing can be tested locally without Docker or an API key:
+## Running tests locally
 
 ```bash
 python -m pytest -q tests
 ```
 
-## Troubleshooting
+This project is intentionally designed to be testable without making API calls or needing a live Docker environment for the unit-level workflow tests.
 
-- **Docker API/daemon connection error:** start Docker Desktop and confirm
-  `docker ps` works.
-- **`ANTHROPIC_API_KEY` missing:** source `.env` in the same terminal session
-  (`set -a; source .env; set +a`) or set the variable directly.
-- **Python `ModuleNotFoundError` for a repo module:** use `python -m pytest`
-  in the test command and ensure the module is in the mounted repo.
-- **No files found from test output:** check that pytest actually collected and
-  ran tests; collection errors or zero collected tests may not match the
-  context extractor's failure patterns.
-- **Patch application fails:** inspect the emitted patch file and target repo
-  diff; the diff paths/context may not match the current working tree.
+## Summary
+
+This project is a practical self-healing CI system for real repos: it fails fast, extracts context, asks for a minimal patch, verifies it in containers, and can turn a green result into a PR. The core idea is not just “AI in CI” — it is a repair loop with validation and safe review boundaries.
+
