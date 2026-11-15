@@ -144,47 +144,95 @@ This makes the system useful for debugging model behavior and verifying that a f
 
 > Why there is no `platform` in the action command by default: the local CLI already supports `--platform`, but the composite action interface did not expose it until this fix. The action now forwards `platform` to `heal.py`, which matters for Apple Silicon hosts or projects that need `linux/amd64` compatibility.
 
-## 3-step Quickstart
+## CI and self-healing GitHub Actions workflows
 
-Add this workflow to your repo and replace the example values with your project details.
+Use two workflow files. The first runs the complete test suite on pushes and pull requests. The second listens for the `CI` workflow to finish and starts healing only when that run fails.
+
+### 1. Run all tests: `.github/workflows/ci.yml`
 
 ```yaml
-# 1) Add .github/workflows/self-heal.yml
-name: Self-healing CI
+name: CI
+
 on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: python -m pytest -q
+```
+
+### 2. Heal a failed CI run: `.github/workflows/self-heal.yml`
+
+```yaml
+name: Self-heal
+
+on:
+  workflow_dispatch:
   workflow_run:
     workflows: ["CI"]
     types: [completed]
 
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: self-heal-${{ github.event.workflow_run.head_branch || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
-  self-heal:
-    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+  heal:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
+    timeout-minutes: 30
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'failure' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
+       !startsWith(github.event.workflow_run.head_branch, 'self-healing/'))
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
 
-      # 2) Add the action and pass the required inputs
       - name: Heal the failing branch
         uses: your-org/self-healing-ci@v1
         with:
-          test-cmd: pytest -q
+          test-cmd: >-
+            python -m pytest -q
+            --deselect tests/test_fixture_context.py::test_docker_runner_generates_junit_xml_report
           setup-cmd: pip install -r requirements.txt
           image: python:3.11
-          platform: linux/amd64   # optional, useful on Apple Silicon or cross-arch builds
+          max-attempts: "3"
+          branch: ${{ github.event.workflow_run.head_branch || github.ref_name }}
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          create-pr: "true"
-          cache-image: "true"
-
-      # 3) Watch for the PR created from the self-healing branch
-      # The action creates/updates a branch like self-healing/<branch>
-      # and opens a PR back to the original failing branch.
+          langfuse-public-key: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          langfuse-secret-key: ${{ secrets.LANGFUSE_SECRET_KEY }}
+          langfuse-base-url: ${{ secrets.LANGFUSE_BASE_URL }}
 ```
 
-That is the fastest way to use the action in a real repository.
+Replace `your-org/self-healing-ci@v1` with the action repository and release tag. The `workflow_run` trigger must match the CI workflow name (`CI`). The guard ensures healing runs only after a failure from the same repository and skips `self-healing/*` branches to prevent a loop. The manual `workflow_dispatch` trigger is available for testing.
+
+The regular CI workflow above runs all tests on the GitHub runner. The healing action runs its configured `test-cmd` inside its Docker test environment to reproduce and verify the failure. If a test requires host Docker access, adjust the action's test command to exclude that test, as this repository does in its own [self-heal workflow](.github/workflows/self-heal.yml).
+
+Add these GitHub repository secrets under **Settings → Secrets and variables → Actions**:
+
+- `ANTHROPIC_API_KEY` — required for patch generation.
+- `LANGFUSE_PUBLIC_KEY` — optional, enables Langfuse tracing.
+- `LANGFUSE_SECRET_KEY` — optional, enables Langfuse tracing.
+- `LANGFUSE_BASE_URL` — optional Langfuse endpoint, such as `https://cloud.langfuse.com` or your self-hosted URL.
+
+The action also uses the built-in `GITHUB_TOKEN` secret to push the repair branch and open a PR. Ensure **Settings → Actions → General → Allow GitHub Actions to create and approve pull requests** is enabled if you want it to open PRs.
 
 ## Local quickstart
 
@@ -241,6 +289,7 @@ The composite action in [action.yml](action.yml) supports these inputs:
 | `test-cmd` | yes | | command that runs tests in the container |
 | `setup-cmd` | no | empty | one-time env setup for the Docker image |
 | `image` | no | empty | base Docker image |
+| `platform` | no | empty | Docker target platform such as `linux/amd64` |
 | `max-attempts` | no | `3` | max fix attempts plus one final verification |
 | `model` | no | `claude-sonnet-5-5` | Anthropic model |
 | `anthropic-api-key` | yes | | API key |
