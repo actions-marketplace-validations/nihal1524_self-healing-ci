@@ -25,37 +25,108 @@ Most failing builds still require a human to debug the test output, identify the
 
 This keeps the repair loop focused on reproducible validation instead of blind AI edits.
 
-## Architecture: the LangGraph repair loop
+## Architecture
+
+### End-to-end: from a failing CI run to a pull request
 
 ```mermaid
 flowchart TD
-    A[run_tests] --> B{Did tests pass?}
-    B -- yes --> Z[done: success or already_passing]
-    B -- no --> C[extract_context]
-    C --> D{Any relevant files?}
-    D -- no --> Z2[done: no_context]
-    D -- yes --> E[generate_plan]
-    E --> F{Patch plan returned?}
-    F -- no --> Z3[done: llm_error]
-    F -- yes --> G[apply_plan]
-    G --> H{Patch applied cleanly?}
-    H -- patch_retry --> C
-    H -- patches_applied --> A
-    H -- patch_error --> Z4[done: patch_error]
-    A --> I{Max attempts exhausted?}
-    I -- yes --> J[mark_exhausted]
-    J --> Z5[done: verification_failed]
+    subgraph TRIGGER["1 - Trigger in your repository"]
+        T1["Push or merge request"] --> T2["CI workflow runs the tests"]
+        T2 -->|"tests pass"| T3(["Nothing to do"])
+        T2 -->|"tests fail"| T4["Self-heal workflow starts<br/>workflow_run, or Run workflow by hand"]
+    end
+
+    T4 --> G{"Guards"}
+    G -->|"fork, or branch starts with self-healing/"| SK(["Skipped"])
+    G -->|"branch of this repo"| S1
+
+    subgraph ENV["2 - Environment (action.yml)"]
+        S1["Check out the failing commit<br/>install the pinned self-healing-ci"] --> S2["Compute the image cache key<br/>base image, setup command,<br/>requirements files, builder code"]
+        S2 --> S3{"Actions cache hit?"}
+        S3 -->|"yes"| S4["docker load the cached images"]
+        S3 -->|"no"| S5["Build the images<br/>pull the base image, run the setup command"]
+    end
+
+    S4 --> H1
+    S5 --> H1
+    S5 -.->|"after the run, even if it failed"| C1["Save the images to the Actions cache"]
+
+    subgraph HEAL["3 - heal.py repair loop (detail in the next diagrams)"]
+        H1["Run the tests in a Docker container<br/>repo mounted at /app"] --> H2{"Tests pass?"}
+        H2 -->|"no, attempts left"| H3["Find the code to fix<br/>and ask Claude for an edit"]
+        H3 --> H4["Apply the edit"]
+        H4 --> H1
+    end
+
+    H2 -->|"yes"| H5{"Was a fix applied?"}
+    H5 -->|"no"| N1(["Already passing: nothing to fix"])
+    H5 -->|"yes"| P1
+    H2 -->|"attempts or retries used up"| F1
+
+    subgraph OUT["4 - Result"]
+        P1["Commit the edits to self-healing/branch<br/>push, then open or update the PR"] --> P2["PR body: root cause, attempts,<br/>Langfuse trace link"]
+        F1["No branch, no PR"] --> F2["Job fails with a clear message<br/>when fail-if-unhealed is true"]
+    end
+
+    LF["Langfuse trace: one span per stage,<br/>token usage and cost, link in the PR"] -.- HEAL
 ```
 
-The actual graph in [core/workflow.py](core/workflow.py) is a state machine with these phases:
+### The repair loop (LangGraph state machine)
 
-1. `run_tests`
-2. `extract_context`
-3. `generate_plan`
-4. `apply_plan`
-5. loop back to `run_tests` until success or the configured attempt limit is reached
+```mermaid
+flowchart TD
+    START(["start"]) --> A["run_tests<br/>Docker container"]
+    A --> B{"route_after_tests"}
+    B -->|"tests passed"| Z1(["done: success or already_passing"])
+    B -->|"runner error"| Z2(["done: runner_error"])
+    B -->|"fix attempts used up<br/>max-attempts"| X["mark_exhausted"]
+    X --> Z3(["done: verification_failed"])
+    B -->|"tests failed, attempts left"| C["extract_context"]
+    C --> D{"files found?"}
+    D -->|"none, or extractor error"| Z4(["done: no_context or context_error"])
+    D -->|"yes"| E["generate_plan<br/>Claude call"]
+    E --> F{"plan returned?"}
+    F -->|"no"| Z5(["done: llm_error"])
+    F -->|"yes"| G["apply_plan"]
+    G --> H{"result"}
+    H -->|"all edits applied"| A
+    H -->|"an edit failed,<br/>fewer than 2 failures so far"| C
+    H -->|"2 failed edits, or an empty plan"| Z6(["done: patch_error"])
+```
 
-This is the core “self-healing” loop: fail -> inspect -> propose -> patch -> verify -> repeat.
+`core/workflow.py` builds this graph. Three limits keep it bounded:
+
+| Limit | Value | Where |
+|---|---|---|
+| Fix attempts | `max-attempts` (default 3), plus one final verification run | action input or `--max-attempts` |
+| Failed edits retried | 2 | `MAX_APPLY_FAILURES` in `core/workflow.py` |
+| Invalid model replies retried | 3 | `MAX_TOOL_ATTEMPTS` in `core/patch_generator.py` |
+
+### Inside `extract_context`, `generate_plan` and `apply_plan`
+
+```mermaid
+flowchart LR
+    subgraph EC["extract_context"]
+        E1["Failing files and lines<br/>from the traceback"] --> E2["AST focus: enclosing function,<br/>methods the test calls,<br/>imported definitions"]
+        E2 --> E3["Imports one level deep,<br/>lib/ and src/ layouts,<br/>submodule imports"]
+        E3 --> E4["Third-party functions that code calls,<br/>read from the Docker image"]
+        E4 --> E5["Files over 800 lines:<br/>reduced view, the rest shown<br/>as omitted lines"]
+    end
+    subgraph GP["generate_plan"]
+        G1["Prompt: file context first,<br/>marked as the cached prefix"] --> G2["Then the failing test output<br/>and notes from earlier attempts"]
+        G2 --> G3["Claude returns the root cause and edits:<br/>file, old text, new text"]
+        G3 --> G4{"Valid reply?"}
+        G4 -->|"no, up to 3 tries"| G2
+    end
+    subgraph AP["apply_plan"]
+        A1{"Edit targets<br/>a test file?"} -->|"yes"| A2["Rejected: tests must not be changed"]
+        A1 -->|"no"| A3{"Old text appears<br/>exactly once?"}
+        A3 -->|"no"| A4["Rejected, with the closest<br/>real lines as a hint"]
+        A3 -->|"yes"| A5["Replace it in the file"]
+    end
+    EC --> GP --> AP
+```
 
 ## How the project works end-to-end
 
@@ -90,7 +161,7 @@ The dependency image is tagged as `self-heal-setup:<hash>` so it can be reused a
 `core/patch_generator.py` sends the failure plus context to Anthropic and asks for a structured patch plan. The patch plan is validated through Pydantic models in `core/models.py`.
 
 ### 5) Patch application
-`core/patch_applier.py` applies each patch to the repo working tree using `git apply` or `patch -p1`, leaving generated patch files behind for review.
+`core/patch_applier.py` applies each edit as an exact search-and-replace: the model's `old` text must appear exactly once in the target file. Edits to test files are rejected, and each applied edit leaves a `.patch` record behind for review.
 
 ### 6) Re-run and verify
 The workflow loops until:
