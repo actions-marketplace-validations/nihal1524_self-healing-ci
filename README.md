@@ -217,7 +217,7 @@ This makes the system useful for debugging model behavior and verifying that a f
 
 ## CI and self-healing GitHub Actions workflows
 
-Use two workflow files. The first runs the complete test suite on pushes and pull requests. The second listens for the `CI` workflow to finish and starts healing only when that run fails.
+Use two workflow files. The first runs the complete test suite on pushes to `main` and on pull requests. The second listens for the `CI` workflow to finish and starts healing only when that run fails.
 
 ### 1. Run all tests: `.github/workflows/ci.yml`
 
@@ -226,6 +226,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 jobs:
@@ -240,6 +241,12 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python -m pytest -q
 ```
+
+> **Note: why `push` is limited to `main`.** With an unfiltered `push:` trigger, a branch that has an open pull
+> request runs CI twice for the same commit (once for the push, once for the PR), and a failure starts two heal
+> runs. Limiting `push` to `main` gives one run per change: the pull request run while a branch is under review,
+> and one run on `main` after the merge (which checks the merged result and is what heals failures on `main`).
+> The trade-off: a branch pushed without a pull request gets no CI and no heal, so open the PR first.
 
 ### 2. Heal a failed CI run: `.github/workflows/self-heal.yml`
 
