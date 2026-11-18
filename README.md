@@ -283,7 +283,7 @@ jobs:
           fetch-depth: 0
 
       - name: Heal the failing branch
-        uses: your-org/self-healing-ci@v1
+        uses: nihal1524/self-healing-ci@v1
         with:
           test-cmd: >-
             python -m pytest -q
@@ -299,7 +299,7 @@ jobs:
           langfuse-base-url: ${{ secrets.LANGFUSE_BASE_URL }}
 ```
 
-Replace `your-org/self-healing-ci@v1` with the action repository and release tag. The `workflow_run` trigger must match the CI workflow name (`CI`). The guard ensures healing runs only after a failure from the same repository and skips `self-healing/*` branches to prevent a loop. The manual `workflow_dispatch` trigger is available for testing.
+This example references the versioned action at `nihal1524/self-healing-ci@v1`. The `workflow_run` trigger must match the CI workflow name (`CI`). The guard ensures healing runs only after a failure from the same repository and skips `self-healing/*` branches to prevent a loop. The manual `workflow_dispatch` trigger is available for testing.
 
 The regular CI workflow above runs all tests on the GitHub runner. The healing action runs its configured `test-cmd` inside its Docker test environment to reproduce and verify the failure. If a test requires host Docker access, adjust the action's test command to exclude that test, as this repository does in its own [self-heal workflow](.github/workflows/self-heal.yml).
 
